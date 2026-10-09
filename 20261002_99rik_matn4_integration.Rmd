@@ -1,0 +1,1573 @@
+---
+title: "scRNA-seq_analysis_96Rik+Matn4-Combo"
+output: html_notebook
+---
+
+Goal: Upload the scRNA-seq datasets generated from lncOL1 mice
+
+```{r init, echo=FALSE}
+setwd("F:/orion_copies/kallisto_out_lncol1_matn4_sort")
+
+```
+
+```{r}
+#install.packages('knitr')
+library(knitr)
+#install.packages('monocle3')
+library(monocle3)
+#install.packages('BiocManager')
+#BiocManager::install("BUSpaRse")
+library(BUSpaRse)
+#BiocManager::install('zealot')
+library(zeallot)
+#install.packages('tidyverse')
+library(tidyverse)
+#install.packages('DropletUtils')
+#library(DropletUtils)
+#install.packages('org.Mm.eg.db')
+#library(org.Mm.eg.db)
+library(dplyr)
+#BiocManager::install("biomaRt")
+library(biomaRt)
+library(DropletUtils)
+
+```
+# Create monocle sc object from kallisto pipeline output
+# Generate knee plots and filter each sample by a minimum UMI count per cell
+```{r}
+# Read Transcript->Gene mapping
+tr2g <- readr::read_tsv("required_files/tr2g.tsv", col_names = FALSE)
+colnames(tr2g)<-c("transcript","gene")
+
+metadata <- read.csv("2026_LncOL1_metadata_matn4.csv")
+
+#These sample names should align with the directory names for kallisto output
+samples_ak<-metadata$sample_id[metadata$batch == 7]
+samples_dh <- metadata$sample_id[metadata$batch < 7]
+
+cds_list<-list()
+# Read genes.mtx
+
+for (i in 1:length(samples_ak)){
+    print(samples_ak[i])
+    mat<-t(Matrix::readMM(paste0(samples_ak[i],"/spliced/s.mtx")))
+    gene_info<-readr::read_tsv(paste0(samples_ak[i],"/spliced/s.genes.txt"), col_names = FALSE)
+    barcodes<-readr::read_tsv(paste0(samples_ak[i],"/spliced/s.barcodes.txt"), col_names = FALSE)
+    
+    cds<-new_cell_data_set(mat,
+                         cell_metadata = barcodes,
+                         gene_metadata = gene_info)
+    
+    #cds <- cds[,Matrix::colSums(exprs(cds)) != 0] 
+    #cds <- estimate_size_factors(cds)
+    pData(cds)$sample_id<-samples_ak[i]
+    
+    cds_list<-c(cds_list,cds)
+}
+
+for (i in 1:length(samples_dh)){
+    print(samples_dh[i])
+    mat<-t(Matrix::readMM(paste0("spliced/",samples_dh[i],"/s.mtx")))
+    gene_info<-readr::read_tsv(paste0("spliced/",samples_dh[i],"/s.genes.txt"), col_names = FALSE)
+    barcodes<-readr::read_tsv(paste0("spliced/",samples_dh[i],"/s.barcodes.txt"), col_names = FALSE)
+    
+    cds<-new_cell_data_set(mat,
+                         cell_metadata = barcodes,
+                         gene_metadata = gene_info)
+    
+    #cds <- cds[,Matrix::colSums(exprs(cds)) != 0] 
+    #cds <- estimate_size_factors(cds)
+    pData(cds)$sample_id<-samples_dh[i]
+    
+    cds_list<-c(cds_list,cds)
+}
+
+#pData(cds_list)
+#fData(cds_list)
+```
+
+
+```{r, knee plots}
+samples<-metadata$sample_id
+numExpected<-4000 #cells targeted
+UMI_cutoff<-1000 #expected UMI in droplets with a cell
+pdf("./output/Knee-plots-test.pdf",width=6,height=6)
+lapply(1:length(samples), function(sampleIdx){
+    print(samples[sampleIdx])
+    #tot_counts<-Matrix::colSums(exprs(cds_list[[sampleIdx]]))
+    bc_rank <- barcodeRanks(exprs(cds_list[[sampleIdx]]), lower = 80)
+    
+    print(qplot(bc_rank$total, bc_rank$rank, geom = "line") +
+      geom_vline(xintercept = metadata(bc_rank)$knee, color = "blue", linetype = 2) +
+      geom_vline(xintercept = metadata(bc_rank)$inflection, color = "green", linetype = 2) +
+      geom_vline(xintercept = UMI_cutoff, color = "darkred", linetype = 2) +
+      geom_hline(yintercept = numExpected, color = "black", linetype = 2) +
+      annotate("text", y = c(1000,5000,10000), x = 1.5 * c(metadata(bc_rank)$knee, metadata(bc_rank)$inflection,UMI_cutoff),
+               label = c(
+                   paste0("knee= ",metadata(bc_rank)$knee," UMIs"), 
+                   paste0("inflection= ",metadata(bc_rank)$inflection," UMIs"),
+                   paste0("UMI_cutoff = ",UMI_cutoff)
+                   ),
+                   color = c("blue", "green","darkred")) +
+      scale_x_log10() +
+      scale_y_log10() +
+      labs(y = "Barcode rank", x = "Total UMI count") + 
+      ggtitle(paste0("Knee Plot - ",samples[sampleIdx]))
+    )
+})
+dev.off()
+```
+
+At this stage each sample is represented by one of the cds in cds_list. 
+Do the filtering at specified cutoffs for each of the cds object, and then merge into one cell data set object.
+```{r}
+# Filter emtpy droplets, this parameter is set based on knee plots / expected cell numbers
+UMI_cutoff<-500 
+#Note-Started with 500, but increased this cutoff later to 1000 based on the appearance of the knee plots
+filtered_cds_list<-lapply(cds_list,function(cds){
+  pData(cds)$Total_UMIs<-Matrix::colSums(exprs(cds))
+  #bc_rank <- barcodeRanks(exprs(cds))
+  #print(metadata(bc_rank)$knee)
+  #print(metadata(bc_rank)$inflection) 
+  filtered_cds<-cds[, pData(cds)$Total_UMIs > UMI_cutoff]
+  return(filtered_cds)
+})
+ 
+# How many cells remain per sample? Does it match the expected cell number?
+lapply(cds_list,function(x){dim(x)[2]})
+
+lapply(filtered_cds_list,function(x){dim(x)[2]})
+
+#Combine cds files
+#cds<-combine_cds(filtered_cds_list, cell_names_unique = TRUE)
+cds<-do.call(cbind,filtered_cds_list)
+
+saveRDS(cds,"docall_combined_UMI500_cds.rds")
+cds <- readRDS("docall_combined_UMI500_cds.rds")
+
+colnames(fData(cds))<-c("gene_id")
+rownames(cds)<-fData(cds)$gene_id
+#colnames(pData(cds))[1]<-"barcode"
+#rownames(pData(cds))<-paste(pData(cds)$barcode,pData(cds)$sample_id,sep=".")
+colnames(cds)<-rownames(pData(cds))
+
+# Summary stats
+cds<-detect_genes(cds, min_expr = 0)
+saveRDS(cds,"genes_detected_UMI500_cds.rds")
+cds_test<-readRDS("genes_detected_UMI500_cds.rds")
+rm(cds_test)
+```
+
+## Add gene-level annotation from BioMaRt (Get and add gene symbols from biomart)
+Using the `gene_id` information in the featureData slot, we can fetch external annotations for each gene and merge them so we can get more meaningful gene information.  `biomaRt` is an interface in Bioconductor to get information associated with gene_ids.
+```{r}
+#Gene ID mappings using org.mm.eg are good but return "NA" for about half of ensembl id's, including many mitochondrial genes
+#fData(cds)$gene_id_trimmed<-stringr::str_split_fixed(fData(cds)$gene_id,"\\.",2)[,1]
+#symb <- mapIds(org.Mm.eg.db, keys=fData(cds)$gene_id_trimmed, keytype="ENSEMBL", column="SYMBOL")
+#fData(cds)<-merge(fData(cds),as.data.frame(symb),by.x="gene_id_trimmed",by.y=0, all.x = TRUE,sort=FALSE)
+#colnames(fData(cds))<-c("gene_id_trimmed","gene_id","num_cells_expressed","gene_short_name")
+
+#Playing with BioMart, get gene names, use the right ensembl archive for genome used for alignment
+listMarts()
+listEnsemblArchives()
+ensembl <- useEnsembl("ensembl", version = 100) 
+#Used this to match with the previous version used by Dongeun
+#datasets <- listDatasets(ensembl)
+ensembl <- useDataset("mmusculus_gene_ensembl",mart=ensembl)
+
+fData(cds)$gene_id_trimmed <- stringr::str_split_fixed(fData(cds)$gene_id,"\\.",2)[,1]
+
+gene_description <- getBM(attributes = c("ensembl_gene_id_version","external_gene_name","description","chromosome_name"),
+                   filters = "ensembl_gene_id", values = fData(cds)$gene_id_trimmed,  mart = ensembl)
+
+#Prepare info as data frame for merging with sc object
+rownames(gene_description) <- stringr::str_split_fixed(gene_description[,1],"\\.",2)[,1]
+
+rownames(gene_description) <- gene_description[,1]
+
+colnames(gene_description) <- c("gene_id","gene_short_name","description","chromosome_name")
+
+fData(cds)
+head(gene_description)
+
+fData(cds) <- left_join(x=as.data.frame(fData(cds)),y=gene_description)
+
+fData(cds)[fData(cds)$gene_id_trimmed == 'ENSMUSG00000000001',]
+```
+
+# metadata info
+```{r}
+batch<-c("2","3","4","5","6","7")
+processing_date<-c("20190507","20190509","20200710","20200713","20200717","20230621")
+age<-c("P30","P180","P360","P720")
+sex<-c("M","F")
+```
+
+## Add cell-level annotations
+```{r eval=make_cds}
+metadata <- read.csv("2026_LncOL1_metadata_matn4.csv")
+index <- metadata$sample_id
+values <- c(7,7,7,2,3,4,5,6,6)
+pData(cds)$batch <- values[as.factor(match(pData(cds)$sample_id,index))]
+
+pData(cds)$processing_date <- processing_date[match(pData(cds)$batch,batch)]
+
+index <- metadata$sample_id
+age <- metadata$age
+pData(cds)$age <- age[as.factor(match(pData(cds)$sample_id,index))]
+
+sex <- metadata$sex
+pData(cds)$sex <- sex[match(pData(cds)$sample_id,index)]
+
+genotype <- metadata$genotype
+pData(cds)$genotype <- genotype[match(pData(cds)$sample_id,index)]
+
+pData(cds)
+fData(cds)
+
+save_monocle_objects(cds,"annotated_UMI500_cds.rds")
+#cds_test <- load_monocle_objects("annotated_UMI500_cds.rds")
+pData(cds_test)
+fData(cds_test)
+rm(cds_test)
+```
+
+# Choosing correct batches from Dongeun's dataset and our current dataset (Batch 7)
+```{r}
+table(pData(cds)$sample_id)
+table(pData(cds)$batch)
+cds <- cds[,pData(cds)$batch %in% c(2,3,5,7)]
+table(pData(cds)$sample_id)
+table(pData(cds)$batch)
+```
+
+
+# Supplementary Data 3- Plotting QC metrics before removing any cells
+## Supplementary Data 3a- Number of genes expressed per cell
+```{r}
+pdf ("F:/orion_copies/kallisto_out_lncol1_matn4_sort/num_genes_p_cell.pdf", width = 6, height = 6)
+hist(pData(cds)$num_genes_expressed,col="darkgreen",breaks=50,main="Number of genes expressed per cell", ylim = c(0,3500), xlim = c(0,10000))
+dev.off()
+```
+## Supplementary Data 3b- Number of genes expressed per cell
+```{r}
+pdf ("F:/orion_copies/kallisto_out_lncol1_matn4_sort/num_cells_exp_gene.pdf", width = 6, height = 6)
+hist(log10(fData(cds)$num_cells_expressed),col="red",breaks=50,main="Number of cells expressing a given gene", xlim = c(0,5) )
+numCells<-10
+abline(v=log10(numCells),lty="dashed")
+dev.off()
+```
+
+## Supplementary Data 3c- Mitochondrial ratio
+```{r}
+
+pdf ("F:/orion_copies/kallisto_out_lncol1_matn4_sort/mito_ratio_0.05.pdf", width = 6, height = 6)
+
+mito_genes<-fData(cds)$gene_short_name[grep("^mt-",fData(cds)$gene_short_name)]
+mt_rows <- grepl("^mt-", fData(cds)$gene_short_name, ignore.case = TRUE)
+sum(mt_rows) 
+pData(cds)$mt_reads <- Matrix::colSums(exprs(cds)[mt_rows, , drop = FALSE])
+pData(cds)$total_reads  <- Matrix::colSums(exprs(cds))
+pData(cds)$mito_ratio <- pData(cds)$mt_reads/pData(cds)$total_reads
+head(pData(cds)$mito_ratio )
+hist(pData(cds)$mito_ratio,col="darkgreen",breaks=50,main="mito", ylim = c(0, 20000), xlim = c(0,1))
+
+abline(v=0.05,lty="dashed")
+
+dev.off()
+```
+## Supplementary Data 3d- Library saturation
+```{r}
+
+pdf ("F:/orion_copies/kallisto_out_lncol1_matn4_sort/library_saturation.pdf", width = 6, height = 6)
+
+ggplot(as.data.frame(pData(cds)),aes(x=log10(total_reads),y=log10(num_genes_expressed))) +
+  geom_bin2d(bins = 50) +
+  scale_fill_continuous(type = "viridis") +
+
+  ggtitle("Library Saturation")
+
+
+dev.off()
+```
+
+
+# Remove genes with no or low detectable signal
+```{r eval=make_cds}
+numCells<-10
+cds<-cds[fData(cds)$num_cells_expressed >= numCells,]
+```
+
+# Save cds file
+```{r save_cds, eval=make_cds}
+save_monocle_objects(cds,"annotated_UMI500_cds_filtered_corr")
+```
+
+## (Re)Load CDS (shortcut)
+```{r reload_cds}
+cds<-load_monocle_objects("annotated_UMI500_cds_filtered_corr")
+```
+
+## Pre-QC summary
+Here are the per-condition cells/nuclei _*before*_ any QC controls (ie. raw yield from scRNA-Seq workflow).  
+```{r}
+kable(table(pData(cds)$age,pData(cds)$sex))
+kable(table(pData(cds)$batch,pData(cds)$age))
+kable(table(pData(cds)$age,pData(cds)$genotype))
+```
+
+# Moving to OneDrive for QC
+```{r}
+setwd("C:/Users/User/OneDrive - Johns Hopkins/Documents/R_Data/96Rik_w_Matn4/Re-analysis/for_revisions")
+save_monocle_objects(cds,"annotated_UMI500_cds_filtered.rds")
+```
+
+## Load object
+```{r}
+#copied the following directly into the console
+cds<-load_monocle_objects("annotated_UMI500_cds_filtered.rds")
+pData(cds)
+fData(cds)
+```
+
+### QC metrics
+Next we can actually start to assess some of the important quality metrices for each gene and each cell.
+
+#### Get Expressed Genes
+```{r gene_qc_1}
+#First, updating the UMI cutoff to the stricter cutoff based on the original knee plots
+cds <- cds[,pData(cds)$Total_UMIs > 1000]
+
+numCells<-10
+cds<-detect_genes(cds)
+expressed_genes <- row.names(subset(fData(cds),
+    num_cells_expressed >= numCells))
+
+length(expressed_genes)
+```
+
+Lets log transform and look again. This time, we'll add a threshold line showing our cutoff for 'expressed genes'.
+```{r num_cells_expressing_log}
+hist(log10(fData(cds)$num_cells_expressed),col="red",breaks=50,main="log10 Number of cells expressing a given gene")
+abline(v=log10(numCells),lty="dashed")
+```
+
+We have now identified a total of `r length(expressed_genes)` that are detectably expressed in at least `r numCells` cells in our dataset.
+
+#### Distribution of gene mean copies per cell
+What is the average expression level (in mRNA Copies per cell) for each gene?
+```{r gene_qc_2}
+fData(cds)$mean_cpc<-Matrix::rowMeans(exprs(cds))
+hist(log10(fData(cds[expressed_genes,])$mean_cpc),col="purple",breaks=50,main="Mean RNA copies per cell")
+
+```
+
+### Cell QC metrics
+
+#### Distribution of detected genes across cells/age
+How many genes are expressed in a given cell/age?
+```{r cell_qc_1}
+hist(pData(cds)$num_genes_expressed,col="darkgreen",breaks=50,main="Number of genes expressed per cell")
+
+#Skipped
+#p.nGenes<-ggplot(as.data.frame(pData(rik)),aes(x=log10(num_genes_expressed),fill=age)) +
+#  geom_density() +
+#  facet_grid(sample) +
+#  scale_fill_brewer(palette="Set1") + 
+#  monocle3:::monocle_theme_opts() +
+#  ggtitle("Distribution of Log10 genes detected per cell")
+
+#p.nGenes
+```
+
+#### Mt-genome proportion
+A high proportion of mitochondrial genes may indicate a lower than ideal capture efficiency for a given cell. Here we identify the subset of mitochondrial genes and look at the proportion of reads mapping to 'mt-' genes vs genomic genes.
+```{r cell_qc_mito}
+mito_genes<-fData(cds)$gene_short_name[grep("^mt-",fData(cds)$gene_short_name)]
+mt_rows <- grepl("^mt-", fData(cds)$gene_short_name, ignore.case = TRUE)
+sum(mt_rows) 
+pData(cds)$mt_reads <- Matrix::colSums(exprs(cds)[mt_rows, , drop = FALSE])
+pData(cds)$total_reads  <- Matrix::colSums(exprs(cds))
+pData(cds)$mito_ratio <- pData(cds)$mt_reads/pData(cds)$total_reads
+head(pData(cds)$mito_ratio )
+hist(pData(cds)$mito_ratio,col="darkgreen",breaks=50,main="mito")
+
+
+save_monocle_objects(cds,"annotated_UMI1000_cds_filtered_mito_ratio.rds")
+cds<-load_monocle_objects("annotated_UMI1000_cds_filtered_mito_ratio.rds")
+```
+
+
+# remove >50% mito-ratio
+```{r}
+#This is very high! I kept it so high to see if we could detect dying cells in our analysis- Later I moved this down to the standard 5%
+cds <- cds[,!pData(cds)$mito_ratio > 0.50]
+```
+
+#### Total mRNAs per cell
+```{r total_mRNAs}
+pData(cds)$total_reads<-Matrix::colSums(exprs(cds))
+
+cds <- cds[,pData(cds)$total_reads < 1e6]
+upper_bound <- 10^(mean(log10(pData(cds)$total_reads)) +
+                    2*sd(log10(pData(cds)$total_reads)))
+lower_bound <- 10^(mean(log10(pData(cds)$total_reads)) -
+                    2*sd(log10(pData(cds)$total_reads)))
+
+
+p.UMIs<-ggplot(as.data.frame(pData(cds)),aes(x=log10(total_reads))) +
+  geom_density() +
+
+  scale_fill_brewer(palette="Set1") + 
+  monocle3:::monocle_theme_opts() +
+  ggtitle("Distribution of Log10 Total UMIs (mRNAs) recovered per cell") +
+          geom_vline(xintercept = log10(lower_bound)) +
+        geom_vline(xintercept = log10(upper_bound))
+
+p.UMIs
+
+```
+
+#### Library Saturation curves
+
+```{r}
+p.sat<-ggplot(as.data.frame(pData(cds)),aes(x=log10(total_reads),y=log10(num_genes_expressed))) +
+  geom_bin2d(bins = 50) +
+  scale_fill_continuous(type = "viridis") +
+
+  ggtitle("Library Saturation")
+
+p.sat
+```
+#Identifying all non_OL in dataset
+```{r Removing non-oligo lineage cells from the 96Rik dataset}
+rownames(colData(cds)) <- colnames(cds)
+cds <- estimate_size_factors(cds)
+cds <- preprocess_cds(cds, num_dim = 100)
+plot_pc_variance_explained(cds)
+cds <- preprocess_cds(cds, num_dim = 26)
+#See an inflection point around 26
+cds <- reduce_dimension(cds)
+plot_cells(cds)
+
+plot_cells(cds,genes = c('Pdgfra','Matn4','Cspg4', "Olig2","Mbp", "Rbfox3","Gad1","Slc32a1","Syp", "Gfap", "Aqp4"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+plot_cells(cds,genes = c('Olig2'), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+
+colnames(pData(cds))[1]<-"barcode"
+rownames(pData(cds))<-paste(pData(cds)$barcode,pData(cds)$sample_id,sep=".")
+colnames(cds)<-rownames(pData(cds))
+cds <- cluster_cells(cds, k= 45)
+
+
+save_monocle_objects(cds,"20260204_cds_pre_batch_corr_UMI1000.rds")
+#cds<-load_monocle_objects("20260204_cds_pre_batch_corr.rds")
+
+
+plot_cells(cds, color_cells_by = "cluster", label_cell_groups = FALSE )
+
+marker_test_res <- top_markers(cds, group_cells_by="cluster", 
+                               reference_cells=1000)
+
+gene_short_name <- fData(cds)$gene_short_name
+gene_id <- fData(cds)$gene_id
+marker_test_res$gene_short_name <- gene_short_name[match(marker_test_res$gene_id,gene_id)]
+
+
+write.csv(marker_test_res, "20260204_marker_cluster_genes_contamination_UMI1000.csv")
+save_monocle_objects(cds,"20260204_cds_pre_batch_corr_marker_genes_UMI1000.rds")
+
+#1- OL
+#2- OL
+#3- OL
+#4- OL
+#5- OL
+#6- OL
+#7- OL
+#8- microglia
+#9- OL
+#10- Neuron
+#11- OL
+#12- Endothelial
+#13- OL
+#14- Neuron
+#15- Astrocyte
+
+
+
+cl <- clusters(cds, reduction_method = "UMAP")
+idx <- as.character(cl) %in% as.character(1:7,9,11,13)
+colData(cds)$coarse_id <- NA_character_
+colData(cds)$coarse_id[idx] <- "ol_lin"
+
+idx <- as.character(cl) %in% as.character(12)
+colData(cds)$coarse_id[idx] <- "endothelial"
+
+idx <- as.character(cl) %in% as.character(10,14)
+colData(cds)$coarse_id[idx] <- "neuron"
+
+idx <- as.character(cl) %in% as.character(15)
+colData(cds)$coarse_id[idx] <- "astrocyte"
+
+idx <- as.character(cl) %in% as.character(8)
+colData(cds)$coarse_id[idx] <- "microglia"
+
+save_monocle_objects(cds,"20260207_cds_coarse_ids_UMI1000.rds")
+#cds <- load_monocle_objects("20260207_cds_coarse_ids_UMI1000.rds")
+```
+
+## ED Fig. 3g- Pie plotting of the non-OL cells in the dataset
+```{r Plot pie chart of the non-OL cells}
+#grouping together all contamination for simplicity
+library(ggplot2)
+
+cl <- clusters(cds, reduction_method = "UMAP")
+idx <- as.character(cl) %in% as.character(1:7,9,11,13)
+colData(cds)$v_coarse_id <- NA_character_
+colData(cds)$v_coarse_id[idx] <- "ol_lin"
+
+idx <- as.character(cl) %in% as.character(12)
+colData(cds)$v_coarse_id[idx] <- "non-ol"
+
+idx <- as.character(cl) %in% as.character(10,14)
+colData(cds)$v_coarse_id[idx] <- "non-ol"
+
+idx <- as.character(cl) %in% as.character(15)
+colData(cds)$v_coarse_id[idx] <- "non-ol"
+
+idx <- as.character(cl) %in% as.character(8)
+colData(cds)$v_coarse_id[idx] <- "non-ol"
+
+#pie for lncol1
+coarse_ids <- table(pData(cds)$v_coarse_id[pData(cds)$genotype == "lncol1_egfp"])
+
+counts <- coarse_ids
+pct <- 100 * counts / sum(counts)
+pct
+labs <- paste0(names(counts), " (", round(pct, 1), "%)")
+cb <- c( "#CC79A7", "#009E73")
+p <- (pie(counts,
+labels = NA,
+col = cb,
+border = NA,
+clockwise = TRUE,
+init.angle = 90))
+
+
+df <- data.frame(cat = names(coarse_ids), val = as.numeric(coarse_ids))
+library(ggplot2)
+p <- ggplot(df, aes(x = 1, y = val, fill = cat)) + geom_col(width = 1, color = NA) + coord_polar(theta = "y") + scale_fill_manual(values = cb) + theme_void()
+ggsave("coarse_ids_donut_lncol1.png", plot = p, width = 6, height = 6, bg = "transparent")
+
+#pie for matn4
+coarse_ids <- table(pData(cds)$v_coarse_id[pData(cds)$genotype == "matn4_megfp"])
+
+counts <- coarse_ids
+pct <- 100 * counts / sum(counts)
+pct
+labs <- paste0(names(counts), " (", round(pct, 1), "%)")
+cb <- c( "#CC79A7", "#009E73")
+p <- (pie(counts,
+labels = NA,
+col = cb,
+border = NA,
+clockwise = TRUE,
+init.angle = 90))
+
+
+df <- data.frame(cat = names(coarse_ids), val = as.numeric(coarse_ids))
+library(ggplot2)
+p <- ggplot(df, aes(x = 1, y = val, fill = cat)) + geom_col(width = 1, color = NA) + coord_polar(theta = "y") + scale_fill_manual(values = cb) + theme_void()
+ggsave("coarse_ids_donut_matn4.png", plot = p, width = 6, height = 6, bg = "transparent")
+
+#saving a csv
+coarse_ids <- table(pData(cds)$coarse_id[pData(cds)$genotype == "lncol1_egfp"])
+
+write.csv(coarse_ids, "coarse_ids.csv")
+
+```
+
+#Selecting only OL lineage cells
+```{r }
+cds <- cds[,cds@clusters@listData[["UMAP"]][["clusters"]] %in% c(1:7,9,11,13)]
+
+plot_cells(cds, color_cells_by ="cluster")
+pData(cds)$batch <- as.character(pData(cds)$batch)
+plot_cells(cds, color_cells_by ="batch")
+plot_cells(cds, color_cells_by ="mito_ratio")
+
+cds_low_mito <- cds[,!pData(cds)$mito_ratio > 0.05]
+
+
+#confirming they're all expressing markers of the OL lineage
+plot_cells(cds,genes = c('Olig2'), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+plot_cells(cds_low_mito,genes = c('Olig2'), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+plot_cells(cds_low_mito, color_cells_by ="mito_ratio")
+
+save_monocle_objects(cds_low_mito, "20260207_cds_ol_lin_only_low_mito.rds")
+```
+
+#Testing Different Alignment strategies
+##Align CDS according to batch only
+```{r Aligning just based on batch which was converted to a character rather than a factor}
+library(BiocParallel)
+#cds_low_mito <- load_monocle_objects("20260207_cds_ol_lin_only_low_mito.rds")
+
+cds_lo <- cds_low_mito
+rm(cds_low_mito)
+pData(cds_lo)$batch <- as.character(pData(cds_lo)$batch)
+cds_lo <- align_cds(cds_lo, alignment_group = "batch")
+
+cds_lo <- detect_genes(cds_lo)
+cellCutoff<-10
+
+expressed_genes <- row.names(subset(fData(cds_lo),
+    num_cells_expressed >= cellCutoff))
+
+expressed_genes <- intersect(row.names(rowData(cds_lo)), expressed_genes)
+
+cds_lo <- reduce_dimension(cds_lo,
+                        max_components=2,
+                        preprocess_method = "Aligned",
+                        reduction_method="UMAP",
+                        umap.min_dist = 0.1,
+                        umap.metric="cosine",
+                        umap.n_neighbors= 15L,
+                        umap.fast_sgd=FALSE,
+                        cores=1
+                        )
+
+library(ggplot2)
+
+plot_cells(cds_lo,genes = c('Pdgfra','Matn4','Cspg4', "Bmp4","Enpp6","9630013A20Rik", "Olig2","Mbp","Aspa"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+
+plot_cells(cds_lo,color_cells_by="batch",cell_size=0.75, label_cell_groups=FALSE, alpha = 0.3)
+
+plot_cells(cds_lo,color_cells_by="mito_ratio",cell_size=0.75, label_cell_groups=FALSE, alpha = 0.3)
+
+save_monocle_objects(cds_lo, "20260207_align_batch_5mt")
+```
+
+
+```{r}
+plot_cells(cds_lo,genes = c('Pdgfra','Matn4','Cspg4', "Bmp4","Enpp6","9630013A20Rik", "Olig2","Mbp","Aspa"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+
+plot_cells(cds_lo,genes = c('Epcam'), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+
+cds_lo <- cluster_cells(cds_lo, resolution = 1e-4)
+
+plot_cells(cds_lo,color_cells_by = "cluster", norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)
+
+marker_test_res <- top_markers(cds_lo, group_cells_by="cluster", 
+                               reference_cells=1000)
+
+gene_short_name <- fData(cds_lo)$gene_short_name
+gene_id <- fData(cds_lo)$gene_id
+marker_test_res$gene_short_name <- gene_short_name[match(marker_test_res$gene_id,gene_id)]
+
+write.csv(marker_test_res, "20260207_marker_cluster_genes_lineage.csv")
+
+plot_cells(cds_lo,color_cells_by = "cluster", norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE)  
+
+
+cluster <- c(1,2,3,4,5,6,7,8,9,10,11,12,13)
+identity<-c("6_myelin_forming_ol", #1
+            "3_quiescent_OPC", #2
+            "3_quiescent_OPC", #3
+            "4_differentiating_OPC", #4
+            "6_myelin_forming_ol", #5
+            "6_myelin_forming_ol", #6
+            "1_early_cycling_OPC", #7
+            "7_mito_opc", #8
+            "5_newly_formed_ol", #9
+            "5_newly_formed_ol", #10
+            "2_late_cycling_OPC", #11
+            "9_mito_ol", #12
+            "8_mito_diff" #13
+            )
+
+pData(cds_lo)$identity <- identity[match(cds_lo@clusters@listData[["UMAP"]][["clusters"]],cluster)]
+pData(cds_lo)
+plot_cells(cds_lo,color_cells_by = "identity", label_cell_groups = FALSE, alpha = 0.2)
+
+save_monocle_objects(cds_lo, "20260207_cds_labeled.rds")
+```
+
+##Sorting out low quality cell groups
+```{r}
+cds_lo <- load_monocle_objects("20260204_cds_labeled.rds")
+
+#two identities appear to have higher mitochondrial ratios- doing tests to determine their overall quality
+
+#testing to see if any are significantly different groups based on mito_ratio
+ggplot2::ggplot(as.data.frame(SummarizedExperiment::colData(cds_lo)), ggplot2::aes(x = identity, y = mito_ratio, fill = identity)) + ggplot2::geom_violin(scale = "width", trim = FALSE) + ggplot2::geom_boxplot(width = 0.1, outlier.shape = NA, color = "gray30") + ggplot2::theme_classic() + ggplot2::labs(x = "Identity", y = "Mitochondrial ratio") + ggplot2::guides(fill = "none")
+
+df <- as.data.frame(SummarizedExperiment::colData(cds_lo))
+df <- df[!is.na(df$mito_ratio) & !is.na(df$identity), ]
+df$identity <- as.factor(df$identity)
+
+kw <- kruskal.test(mito_ratio ~ identity, data = df)
+print(kw)
+pw <- pairwise.wilcox.test(df$mito_ratio, df$identity, p.adjust.method = "BH", exact = FALSE)
+
+pw_df <- reshape2::melt(pw$p.value, na.rm = TRUE)
+names(pw_df) <- c("group1", "group2", "p_adj")
+sig_pairs <- subset(pw_df, p_adj < 0.05)
+print(sig_pairs)
+
+library(dplyr)
+as.data.frame(SummarizedExperiment::colData(cds_lo)) %>%
+group_by(identity) %>%
+summarize(n = n(), mean_mito = mean(mito_ratio, na.rm = TRUE), .groups = "drop") %>%
+arrange(desc(mean_mito))
+
+#testing to see if any are significantly different groups based on Total_UMI
+ggplot2::ggplot(as.data.frame(SummarizedExperiment::colData(cds_lo)), ggplot2::aes(x = identity, y = Total_UMIs, fill = identity)) + ggplot2::geom_violin(scale = "width", trim = FALSE) + ggplot2::geom_boxplot(width = 0.1, outlier.shape = NA, color = "gray30") + ggplot2::theme_classic() + ggplot2::labs(x = "Identity", y = "Total_UMIs") + ggplot2::guides(fill = "none")
+
+df <- as.data.frame(SummarizedExperiment::colData(cds_lo))
+df <- df[!is.na(df$Total_UMIs) & !is.na(df$identity), ]
+df$identity <- as.factor(df$identity)
+
+kw <- kruskal.test(Total_UMIs ~ identity, data = df)
+print(kw)
+pw <- pairwise.wilcox.test(df$Total_UMIs, df$identity, p.adjust.method = "BH", exact = FALSE)
+
+pw_df <- reshape2::melt(pw$p.value, na.rm = TRUE)
+names(pw_df) <- c("group1", "group2", "p_adj")
+sig_pairs <- subset(pw_df, p_adj < 0.05)
+print(sig_pairs)
+
+as.data.frame(SummarizedExperiment::colData(cds_lo)) %>%
+group_by(identity) %>%
+summarize(n = n(), mean_umi = mean(Total_UMIs, na.rm = TRUE), .groups = "drop") %>%
+arrange(desc(mean_umi))
+
+#Two of the unusual clusters have the lowest mito_ratio and number of UMIs,  the mito_OL and mito_OPC, respectively, and they are significantly different from all other groups. If you are interested in either of these clusters, feel free to leave them in, as they could represent interesting death pathways in OPCs or OLs!
+
+cds_lo <- cds_lo[, !(as.character(pData(cds_lo)$identity) %in% c("7_mito_opc","9_mito_ol"))]
+plot_cells(cds_lo,color_cells_by = "identity", norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 0.75, label_cell_groups = FALSE) 
+
+#updated to merge mito_diff with diff
+
+cds_lo$identity[cds_lo$identity =="8_mito_diff"] <- "4_differentiating_OPC"
+
+
+#save_monocle_objects(cds_lo, "20260207_cds_labeled_cleaned.rds")
+#cds_lo <- load_monocle_objects("20260207_cds_labeled_cleaned.rds")
+```
+
+
+# Coverting to CellxGene Compatible Object
+```{r}
+#BiocManager::install("zellkonverter")
+library(zellkonverter)
+
+aws_batch <- cds_lo
+
+aws_batch@rowRanges@elementMetadata@listData[["gene_short_name"]] <- make.unique(aws_batch@rowRanges@elementMetadata@listData[["gene_short_name"]])
+
+
+assay(aws_batch, "logcounts") <- normalized_counts(aws_batch)
+
+assays(aws_batch)
+
+assay(aws_batch, "counts") <- NULL
+
+assays(aws_batch)
+
+reducedDims(aws_batch)
+reducedDims(aws_batch)[["X_PCA"]] <- reducedDims(aws_batch)[["PCA"]]
+reducedDims(aws_batch)[["X_UMAP"]] <- reducedDims(aws_batch)[["UMAP"]]
+
+reducedDims(aws_batch)
+
+colData(aws_batch) <- colData(aws_batch)[c("Size_Factor","age","genotype","batch","sex","mito_ratio","identity")]
+
+rowData(aws_batch)
+rowData(aws_batch) <- rowData(aws_batch)["gene_short_name"]
+rowData(aws_batch)
+
+#BiocManager::install("scRNAseq")
+#library(scRNAseq)
+#AnnDataDependencies(version = "0.7.6")
+#writeH5AD(aws_batch, file = "./20261002_completelin_unique.h5ad",version = "0.7.6",
+#                         X_name = "logcounts", 
+#                         skip_assays = F)
+
+library(SingleCellExperiment)
+sce <- as(aws_batch, "SingleCellExperiment")
+
+#writeH5AD(sce, file = "20261002_completelin_unique.h5ad")
+
+
+```
+
+
+#For text- Cells/genotype
+```{r}
+
+cds_lo <- load_monocle_objects("20260207_cds_labeled_cleaned.rds")
+kable(table(pData(cds_lo)$age,pData(cds_lo)$genotype))
+
+```
+
+
+#Figure 2
+##Figure 2 b
+```{r Generating figures for revisions}
+library(ggplot2)
+#Saved as 2_genotype_both
+
+
+
+plot_cells(cds_lo, color_cells_by = "genotype", label_cell_groups = FALSE, show_trajectory_graph = FALSE, cell_size = 1.5, alpha = 0.7) + ggplot2::scale_color_manual(values = c("#119C72","#55B3E8"))
+
+#2_genotype_matn
+cds_matn <- cds_lo[,(as.character(pData(cds_lo)$genotype) %in% c("matn4_megfp"))]
+plot_cells(cds_matn, color_cells_by = "genotype", label_cell_groups = FALSE, show_trajectory_graph = FALSE, cell_size = 1.5, alpha = 0.7) + ggplot2::scale_color_manual(values = c("#55B3E8"))
+rm(cds_matn)
+
+#2_genotype_lnc
+cds_lnc <- cds_lo[,(as.character(pData(cds_lo)$genotype) %in% c("lncol1_egfp"))]
+plot_cells(cds_lnc, color_cells_by = "genotype", label_cell_groups = FALSE, show_trajectory_graph = FALSE, cell_size = 1.5, alpha = 0.7) + ggplot2::scale_color_manual(values = c("#119C72"))
+rm(cds_lnc)
+```
+##Figure 2 d
+```{r}
+#2_identity_colored
+plot_cells(cds_lo, color_cells_by = "identity", label_cell_groups = FALSE,  cell_size = 1) + ggplot2::scale_color_manual(values = c("#882255","#C17242","#DDCC77","#44AA99","#88CCEE","#332288"))
+
+#For text- Top marker genes by cluster
+marker_test_res <- top_markers(cds_lo, group_cells_by="identity", 
+                               reference_cells=1000)
+
+top_specific_markers <- marker_test_res %>%
+                            filter(fraction_expressing >= 0.10) %>%
+                            group_by(cell_group)
+write.csv(top_specific_markers, "20260408_markers_by_id.csv")
+
+save_monocle_objects(cds_lo, "20260207_cds_labeled_cleaned.rds")
+```
+##Extended data Fig. 3h- Pie chart identities
+```{r}
+#pie for lncol1
+#cds_lo <- load_monocle_objects("20260207_cds_labeled_cleaned.rds")
+
+coarse_ids <- table(pData(cds_lo)$identity)
+
+counts <- coarse_ids
+pct <- 100 * counts / sum(counts)
+pct
+labs <- paste0(names(counts), " (", round(pct, 1), "%)")
+cb <- c( "#882255","#C17242","#DDCC77","#44AA99","#88CCEE","#332288")
+p <- (pie(counts,
+labels = NA,
+col = cb,
+border = NA,
+clockwise = TRUE,
+init.angle = 90))
+
+
+df <- data.frame(cat = names(coarse_ids), val = as.numeric(coarse_ids))
+library(ggplot2)
+p <- ggplot(df, aes(x = 1, y = val, fill = cat)) + geom_col(width = 1, color = NA) + coord_polar(theta = "y") + scale_fill_manual(values = cb) + theme_void()
+ggsave("identities_lncol1.png", plot = p, width = 6, height = 6, bg = "transparent")
+```
+
+
+
+## Figure 2 c
+```{r}
+marker_genes <- c("Mcm6","Ccnb2","Pdgfra","9630013A20Rik","Bcas1","Tcf7l2", "Mal")
+plot_cells(cds_lo, genes = marker_genes, label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 5) 
+
+```
+
+##Figure 2 e 
+
+```{r}
+cds_lo <- cluster_cells(cds_lo)
+cds_lo <- learn_graph(cds_lo, use_partition = FALSE)
+cds_lo
+cds_lo <- order_cells(cds_lo)
+library(viridis)
+library(ggplot2)
+plot_cells(cds_lo, label_cell_groups = FALSE, alpha = 0.3, color_cells_by = "pseudotime", show_trajectory_graph = FALSE)+ scale_color_gradientn(colors = viridis(256, option = "E"))
+
+save_monocle_objects(cds_lo, "20260204_cds_labeled_cleaned_pseudotime.rds")
+```
+##Fig 2 f
+```{r}
+cds_lo <- load_monocle_objects("20260204_cds_labeled_cleaned_pseudotime.rds")
+  
+pseudo_genes <- c("Aspa","Mbp","Bcas1","Cspg4","Top2a")
+pseudo_cds <- cds_lo[rowData(cds_lo)$gene_short_name %in% pseudo_genes]
+pseudo_cds <- order_cells(pseudo_cds)
+plot_genes_in_pseudotime(pseudo_cds, color_cells_by = "identity", min_expr = 0.5, cell_size = 1) + ggplot2::scale_color_manual(values = c("#882255","#C17242","#DDCC77","#44AA99","#88CCEE","#332288"))
+rm(pseudo_cds)
+rm(pseudo_genes)
+
+library(ggplot2)
+library(viridis)
+plot_cells(cds_lo, label_cell_groups = FALSE, alpha = 0.3, color_cells_by = "mito_ratio", show_trajectory_graph = FALSE)+ scale_color_gradientn(colors = viridis(256, option = "F"))
+```
+
+##Fig 2 g
+
+```{r}
+dead_genes <- c("Pdcd4","Sh3rf1","Pim3")
+dead_cds <- cds_lo[rowData(cds_lo)$gene_short_name %in% dead_genes]
+dead_cds <- order_cells(dead_cds)
+plot_genes_in_pseudotime(dead_cds, color_cells_by = "identity", min_expr = 1.5, cell_size = 1) + ggplot2::scale_color_manual(values = c("#882255","#CC6677","#DDCC77","#44AA99","#88CCEE","#332288"))
+rm(dead_cds)
+rm(dead_genes)
+```
+
+##Fig 2 h
+```{r}
+dead_genes <- c("Casp3","Pdcd4","Sh3rf1","Pim3")
+plot_cells(cds_lo, genes = dead_genes, label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 5) 
+
+#save_monocle_objects(cds_lo, "20260205_cds_low_mito.rds")
+#cds_lo <- load_monocle_objects("20260205_cds_low_mito.rds")
+```
+
+#Supplementary Figure
+
+##Sup 3e- Batch effect
+```{r}
+plot_cells(cds_lo, color_cells_by = "batch", show_trajectory_graph = FALSE, label_cell_groups = FALSE, cell_size = 2, alpha = 0.2)+ ggplot2::scale_color_manual(values = c("#648FFF","#785EF0","#DC267F","#FE6100"))
+
+library(dplyr)
+cd <- colData(cds_lo)
+idx <- order(cd$batch == "2")  
+cds_lo_reorder <- cds_lo[, idx]
+
+plot_cells(cds_lo_reorder,color_cells_by = "batch",show_trajectory_graph = FALSE,label_cell_groups = FALSE,cell_size = 2,alpha = 0.8) + ggplot2::scale_color_manual(values = c("#648FFF", "#D2D2D2", "#D2D2D2", "#D2D2D2"))
+
+cd <- colData(cds_lo)
+idx <- order(cd$batch == "3")  
+cds_lo_reorder <- cds_lo[, idx]
+
+plot_cells(cds_lo_reorder,color_cells_by = "batch",show_trajectory_graph = FALSE,label_cell_groups = FALSE,cell_size = 2,alpha = 0.8) + ggplot2::scale_color_manual(values = c("#D2D2D2", "#785EF0", "#D2D2D2", "#D2D2D2"))
+
+idx <- order(cd$batch == "5")  
+cds_lo_reorder <- cds_lo[, idx]
+
+plot_cells(cds_lo_reorder,color_cells_by = "batch",show_trajectory_graph = FALSE,label_cell_groups = FALSE,cell_size = 2,alpha = 0.8) + ggplot2::scale_color_manual(values = c("#D2D2D2", "#D2D2D2", "#DC267F", "#D2D2D2"))
+
+
+idx <- order(cd$batch == "7")  
+cds_lo_reorder <- cds_lo[, idx]
+
+plot_cells(cds_lo_reorder,color_cells_by = "batch",show_trajectory_graph = FALSE,label_cell_groups = FALSE,cell_size = 2,alpha = 0.8) + ggplot2::scale_color_manual(values = c("#D2D2D2","#D2D2D2","#D2D2D2","#FE6100"))
+```
+
+##Sup 2f- Plotting sex
+```{r}
+#plotting sex as a variable
+cd <- colData(cds_lo)
+idx <- order(cd$sex == "M")  
+cds_lo_reorder <- cds_lo[, idx]
+
+plot_cells(cds_lo_reorder,color_cells_by = "sex",show_trajectory_graph = FALSE,label_cell_groups = FALSE,cell_size = 2,alpha = 0.8) + ggplot2::scale_color_manual(values = c("#D2D2D2","#005AB5"))
+
+idx <- order(cd$sex == "F")  
+cds_lo_reorder <- cds_lo[, idx]
+
+plot_cells(cds_lo_reorder,color_cells_by = "sex",show_trajectory_graph = FALSE,label_cell_groups = FALSE,cell_size = 2,alpha = 0.8) + ggplot2::scale_color_manual(values = c("#DC3220","#D2D2D2"))
+
+rm(cds_lo_reorder)
+rm(cd)
+```
+
+
+##Extended data Fig 4a- Pdcd4 graph
+```{r}
+marker_genes <- c("Pdcd4")
+plot_cells(cds_lo, genes = marker_genes, label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 5, cell_size = 1.5) 
+```
+##Extended data Fig 4b- Highlight differentiating cell cluster
+```{r}
+plot_cells(cds_lo, color_cells_by = "identity", label_cell_groups = FALSE, show_trajectory_graph = FALSE, cell_size = 1.5) + ggplot2::scale_color_manual(values = c("#D2D2D2","#D2D2D2","#D2D2D2","#44AA99","#D2D2D2","#D2D2D2"))
+```
+
+## ED 4c- Differentiating cluster by genotype
+```{r}
+library(viridis)
+cds_blob <- cds_lo[,(as.character(pData(cds_lo)$identity) %in% c("4_differentiating_OPC","8_mito_diff"))]
+
+plot_cells(cds_blob, show_trajectory_graph = FALSE, cell_size = 2, color_cells_by = "mito_ratio")+ scale_color_gradientn(colors = viridis(500, option = "rocket"))
+
+cd <- colData(cds_blob)
+idx <- order(cd$genotype == "matn4_megfp")  
+cds_lo_reorder <- cds_blob[, idx]
+plot_cells(cds_blob, color_cells_by = "genotype", label_cell_groups = FALSE, show_trajectory_graph = FALSE, cell_size = 2, alpha = 1) + ggplot2::scale_color_manual(values = c("#D2D2D2","#55B3E8"))
+
+cd <- colData(cds_blob)
+idx <- order(cd$genotype == "lncol1_egfp")  
+cds_lo_reorder <- cds_blob[, idx]
+plot_cells(cds_lo_reorder, color_cells_by = "genotype", label_cell_groups = FALSE, show_trajectory_graph = FALSE, cell_size = 2, alpha = 1) + ggplot2::scale_color_manual(values = c("#119C72","#D2D2D2"))
+
+cds_blob <- cluster_cells(cds_blob)
+plot_cells(cds_blob, show_trajectory_graph = FALSE, cell_size = 1, color_cells_by = "cluster")
+cds_blob <- learn_graph(cds_blob, use_partition = FALSE, learn_graph_control = list(prune_graph= FALSE))
+plot_cells(cds_blob,
+           color_cells_by = "batch",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=TRUE,
+           show_trajectory_graph = TRUE,
+           label_branch_points=TRUE)
+```
+
+## ED 4d Adding gene expression plots
+```{r}
+plot_cells(cds_blob,genes = c("Cspg4"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 2, label_cell_groups = FALSE)
+
+plot_cells(cds_blob,genes = c("Bcas1"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 2, label_cell_groups = FALSE)
+
+plot_cells(cds_blob,genes = c("9630013A20Rik"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 2, label_cell_groups = FALSE)
+
+plot_cells(cds_blob,genes = c("Mbp"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 2, label_cell_groups = FALSE)
+
+plot_cells(cds_blob,genes = c("Mog"), norm_method = c("log", "size_only"), show_trajectory_graph=FALSE, min_expr = 5, cell_size = 2, label_cell_groups = FALSE)
+```
+
+##ED 4e-  Mito ratio plot
+```{r}
+plot_cells(cds_blob, color_cells_by = "mito_ratio", show_trajectory_graph = FALSE, cell_size = 2.5, alpha = 0.75)  + scale_color_viridis(option = "magma")
+```
+
+##ED 4f- Mito violin plot
+```{r}
+
+magma_baby <- c("#A3319F","#F89078")
+
+library(ggplot2)
+plot_cells(cds_blob, color_cells_by = "identity", label_cell_groups = FALSE, show_trajectory_graph = FALSE, cell_size= 2) + scale_color_manual(values =  magma_baby)
+
+ggplot(as.data.frame(pData(cds_blob)), aes(x= identity, y=mito_ratio, fill = identity)) + geom_violin() + scale_fill_manual(values =  c("#A3319F","#F89078")) + theme_classic() 
+
+
+with(as.data.frame(pData(cds_blob)), shapiro.test(pData(cds_blob)$mito_ratio[cds_blob$identity == "8_mito_diff"]))
+
+res <- wilcox.test(mito_ratio ~ identity, data = as.data.frame(pData(cds_blob)),
+                   exact = FALSE)
+res
+#p-value = 4.743e-14
+
+```
+
+
+##ED 4g Pseudotime trajectory plot
+```{r}
+only_grey <- c("#d3d3d3","#d3d3d3")
+plot_cells(cds_blob, color_cells_by = "genotype", 
+          show_trajectory_graph = TRUE, 
+          label_cell_groups = FALSE, 
+          cell_size = 1.5, 
+          alpha = 1, 
+          label_branch_points = FALSE,
+          label_roots = FALSE,
+          label_leaves = FALSE,
+          trajectory_graph_color = "black",
+          trajectory_graph_segment_size = 2
+          ) + scale_colour_manual(values=only_grey)
+```
+
+
+##Spatial correlation in the blob for finding co-regulated genes
+```{r Graph test for co-regulated genes}
+pr_graph_test_res_blob <- graph_test(cds_blob, neighbor_graph="knn")
+pr_deg_ids_blob <- row.names(subset(pr_graph_test_res_blob, morans_I > 0.01 & q_value < 0.05))
+
+gene_module_df_blob <- find_gene_modules(cds_blob[pr_deg_ids_blob], resolution= 1e-3)
+
+library(tidyverse)
+
+gene_id_info <- as.data.frame(fData(cds_blob))
+colnames(gene_id_info)[1] <- "id"
+gene_module_df_annot <- merge(gene_module_df_blob, gene_id_info, by="id")
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob %>% filter(module %in% c(1:5)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = TRUE)
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob %>% filter(module %in% c(6:10)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob %>% filter(module %in% c(11:14)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = TRUE)
+
+write.csv(gene_module_df_annot, "20260206_knn_graph_test_cds_blob.csv")
+```
+
+##Looking for variability along the trajectory graph
+```{r Graph test across the pseudotime trajectory}
+
+cds_blob_pseudotime_pr <- graph_test(cds_blob, neighbor_graph = "principal_graph")
+blob_pr_deg_ids_pseudo <- row.names(subset(cds_blob_pseudotime_pr, q_value <0.05))
+
+save_monocle_objects(cds_blob, "20260206_cds_blob_analysis.rds")
+
+gene_module_df_blob_pseudo <- find_gene_modules(cds_blob[blob_pr_deg_ids_pseudo],resolution=c(10^seq(-6,1)))
+unique(head(gene_module_df_blob_pseudo$module))                                            
+write.csv(gene_module_df_blob_pseudo, "20260206_pseudo_graph_test_cds_blob.csv")
+
+#51
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo %>% filter(module %in% c(1:10)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo %>% filter(module %in% c(11:20)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo %>% filter(module %in% c(21:30)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo %>% filter(module %in% c(31:40)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo %>% filter(module %in% c(41:51)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+
+```
+
+##GO Terms analysis for all cells on Off Ramp
+```{r Spreadsheets of GO Terms modules off ramp}
+#loop for all of the "off ramp" modules
+library(gprofiler2)
+
+gene_id_info <- as.data.frame(fData(cds_blob))
+colnames(gene_id_info)[1] <- "id"
+gene_module_df_blob_pseudo_annot <- merge(gene_module_df_blob_pseudo, gene_id_info, by="id")
+
+mod_num_all <- 1:51
+
+for (i in mod_num_all) {
+module_sp_oc <- gene_module_df_blob_pseudo_annot %>% filter(module %in% i)
+module_sp_gp <- gost(module_sp_oc$gene_short_name, organism="mmusculus", evcodes = TRUE)
+
+mod_sp_gp_sv <- data.frame(module_sp_gp[["result"]][["term_name"]],module_sp_gp[["result"]][["intersection"]])
+#remember to change name here
+#write_csv(mod_sp_gp_sv, sprintf("20241031_surv_mod.%d._gp_oc.csv", i))
+write.csv(mod_sp_gp_sv, sprintf("20260206_all_mod%d_gp_oc_od.csv", i))
+rm(module_sp_gp)
+rm(mod_sp_gp_sv)
+}
+
+#Notes on interesting modules identified and potential genes of interest
+
+#2- DNA damage response
+#Dyrk1b,Hltf,Ikbkg,Apc,Ccng1,Ppp4r3b,Tlk2,Susd6,Mlh3,Ercc6l2,Rad21,Prkdc,Ddb1,Huwe1,Smarcc2,Rbbp5,Dclre1c,Traf6,Fam168a,Herc2,Usp9x,Smarca5,Zbtb7a,Setd7,Ncoa6,Psme4,Cebpg,Upf1,Atxn7l3,Marf1,Bod1l
+
+#2- cellular response to stress
+#Sp1,Npepps,Chordc1,Dyrk1b,Hltf,Cdkn1b,Ikbkg,Apc,Rhoa,Ccng1,Ppp4r3b,Tlk2,Susd6,Atxn3,Mlh3,Ercc6l2,Ywhaz,Rad21,Prkdc,Dnajc18,Ddb1,Vldlr,P4hb,Huwe1,Smarcc2,Rbbp5,Dclre1c,Atf6,Traf6,Ube4b,Fam168a,Eif2ak1,Herc2,Usp9x,Eif2ak3,Smarca5,Neo1,Zbtb7a,Fnip1,Socs5,Setd7,Kdm6a,Opa1,Ncoa6,Nploc4,Cpeb2,Psme4,Ermp1,Tet1,Crebrf,Ywhag,Cebpg,Upf1,Atxn7l3,Marf1,Bod1l,Vkorc1l1,Rgma,Dnajb14,Ccdc47
+
+
+#8- DNA Damage Response
+#Fmr1,Hipk1,Sirt1,Atxn7,Epc1,Xiap,Ints3,Ep400,Xpc,Smg1,Atrx,Mbtps1,Arid2,Morc2a,Emsy,Bclaf1,Ascc3,Zmynd8,Pik3r1,Ppp4r3a,Tlk1,Setd2,Kmt5b,Trim39,Ercc6,Mdm4,Ep300,Usp47,Mbtd1,Taok2,Dot1l,Chd2
+
+#9- Cellular response to stress
+#Uba1,Dynll1,Rpa3,Atf6b,Actr2,Ywhae,Snw1,Eif2s1,Psmc6,Rnaseh2b,Smarcd1,Ube2j2,Cdc5l,Hspd1,Pdcl3,Ubxn4,Nucks1,Parp1,Psmd14,Akirin2,Ube2k,Coq7,Ppp4c,Morf4l2,Rnf126,Nsmce4a,Oard1,Sem1,Ubqln2,Xrcc1,Hmgb1,Ube2d3,Pigbos1
+
+
+#26- Cellular response to stress
+#Fer,Pnpt1,Nf1,Ddx5,Sel1l,Crebbp,Gsk3b,Dyrk1a,Wac,Smc3,Sec16a,Dnajc10,Rad23b,Brd7,Terf2,Sesn3,Smarca4,Fem1b,Fbxo22,Uba5,Vhl,Mtmr3,Supt16,Topors,Mapkap1,Morc3,Dhx9,Vcpip1,Foxo3,Taok3,Bmpr2,Epc2
+
+#26- Apoptotic process
+#Tax1bp1,Fbxo11,Crkl,Ctnnb1,Med1,Akap1,Nf1,Ddx5,Rabep1,Zmynd11,Gsk3b,Axin1,Smad4,Gnaq,Zdhhc3,Dnajc10,Ddx47,Smarca4,Fem1b,Vhl,Topors,Prkci,Mapkap1,Usp53,Foxo3,Adam10,Bmpr2,Epc2
+
+#33- DNA damage response
+#Baz1b,Cbx5,Top2b,Ppm1d,Smc6,Ercc4,Ube2v2,Usp7,Smchd1,Spire1,Skil,Sfpq,Casp2,Smarcad1,Rbbp6,Smarcc1,Atm,Rif1,Kdm1a,Slx4,Nsd2
+
+#37- Positive regulation of cell death
+#Dusp6,Dusp1,Grk2,Cflar,Stk17b,Tnfrsf1a,Btg1,Egr1,Mcl1,Ripk2,Lyn,Plagl2,Jun,Arrb2,Tnfaip8
+
+#Cellular Response to Type II Interferon
+#Ifngr1,Ifngr2,Jak1,Rab20,Sirpa,Rab11fip5
+#Regulation of apoptotic process
+#Zfp385a,Ier3,Mertk,Dusp6,Btg2,Dusp1,Grk2,Lrp5,Cflar,Stk17b,Nfkb1,Tnfrsf1a,Herpud1,Btg1,Egr1,Mcl1,Ripk2,Lyn,Plagl2,Jun,Arrb2,Tnfaip8
+
+#Apoptosis
+#Cflar,Nfkb1,Tnfrsf1a,Irf2,Mcl1,Jun
+
+#38- Regulation of PCD
+
+
+#39- Stress
+#Uhrf1,Clgn,Paxip1,Msh6,Lnpk,Rdm1,Rnf168,Etaa1,Fbxo5,Myb,Pole2,Vrk1,Dek,Dhfr,Rangap1,Slc29a1,Polh,Bard1,Mcm6,Pcna,Smc2,Usp1,Rpa2,Xrcc2,Ung,Ezh2,Mcm7,Blm,Ipo5,Tipin,Topbp1,Smc4,Tdp2,Tmem97,Wdhd1,Smc1a,Spidr,H2ax,Rnaseh2a,Skp2,Hmgb2,Lig1,Cenps
+
+#39- Apoptosis induced fragmentation
+#apop_frag <- c("H1f4","Hmgb2",'H1f5')
+
+#41- Stress
+#Qrich1,Usp15,Cpeb4,Parg,Mapk8ip3,Alkbh8,Atf2,Ulk1,Rnf111,Ireb2,Cep63,Map2k4,Cbl,Otud4,Ubr5,Vps41,Rragb,Setx,Klhl15,Aff4,Brsk2,Kdm2a,Arid1b
+
+#45- Viruses
+
+#48- 
+#regulation of programmed cell death
+#apoptotic process
+#regulation of apoptotic process
+
+#51- Many of inflammation markers etc
+```
+
+##Reviewer comment- Middle of UMAP cells
+```{r}
+cds_blob <- load_monocle_objects("20260206_cds_blob_analysis.rds")
+
+plot_cells(cds_blob, color_cells_by = "identity")
+
+coarse_ids <- table(pData(cds_blob)$batch[pData(cds_blob)$identity == "8_mito_diff"])
+
+counts <- coarse_ids
+pct <- 100 * counts / sum(counts)
+pct
+labs <- paste0(names(counts), " (", round(pct, 1), "%)")
+cb <- c("#648FFF","#785EF0","#DC267F","#FE6100")
+p <- (pie(counts,
+labels = NA,
+col = cb,
+border = NA,
+clockwise = TRUE,
+init.angle = 90))
+
+
+df <- data.frame(cat = names(coarse_ids), val = as.numeric(coarse_ids))
+library(ggplot2)
+p <- ggplot(df, aes(x = 1, y = val, fill = cat)) + geom_col(width = 1, color = NA) + coord_polar(theta = "y") + scale_fill_manual(values = cb) + theme_void()
+ggsave("mito_cluster_by_batch.png", plot = p, width = 6, height = 6, bg = "transparent")
+
+#All cells
+
+coarse_ids <- table(pData(cds_lo)$batch)
+
+counts <- coarse_ids
+pct <- 100 * counts / sum(counts)
+pct
+labs <- paste0(names(counts), " (", round(pct, 1), "%)")
+cb <- c("#648FFF","#785EF0","#DC267F","#FE6100")
+p <- (pie(counts,
+labels = NA,
+col = cb,
+border = NA,
+clockwise = TRUE,
+init.angle = 90))
+
+
+df <- data.frame(cat = names(coarse_ids), val = as.numeric(coarse_ids))
+library(ggplot2)
+p <- ggplot(df, aes(x = 1, y = val, fill = cat)) + geom_col(width = 1, color = NA) + coord_polar(theta = "y") + scale_fill_manual(values = cb) + theme_void()
+ggsave("all_clusters_by_batch.png", plot = p, width = 6, height = 6, bg = "transparent")
+```
+
+##ED 4h- Death related modules
+```{r Plot cells from interesting modules}
+#gene_module_df_blob_pseudo <- read.csv("20260206_pseudo_graph_test_cds_blob.csv")
+
+gene_id_info <- as.data.frame(fData(cds_blob))
+colnames(gene_id_info)[1] <- "id"
+gene_module_df_blob_pseudo_annot <- merge(gene_module_df_blob_pseudo, gene_id_info, by="id")
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo_annot %>% filter(module %in% c(12)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+#Response to stress genes:
+#Chmp1a,Ddx3x,Uba1,Ppard,Cul3,Letm1,Mtrex,Hsp90b1,Canx,Pnpt1,Ccnk,Tomm70a,Dyrk1a,Smarcd1,Cdc5l,Pja2,Pdpk1,Bag6,Grk2,Fundc1,Wdr45b,Bach1,Faf2,Nucks1,Vamp4,Ppp3ca,Map3k7,Ncbp1,Rad23b,Plaa,Pum1,Mtor,Rest,Bcl7a,Smarca4,Nedd4,Fem1b,Vhl,Mtmr3,Supt16,Fbxo45,Usp38,Mapkap1,Kat7,Foxk2,Pbrm1,Dhx9,Arf6,Eif4g1,Lrrc8d,Ythdf3,Zfp809,Chd4,Ipo7
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo %>% filter(module %in% c(36)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+#Death receptor signalling
+#Psen1,Ripk1,Mapk8,Nsmaf,Bag4,Arhgef11,Rnf31
+
+plot_cells(cds_blob, 
+           genes = gene_module_df_blob_pseudo %>% filter(module %in% c(38)),
+           group_cells_by = "cluster", 
+           color_cells_by = "cluster",
+           show_trajectory_graph = FALSE)
+
+
+#save_monocle_objects(cds_blob, "20260207_cds_blob")
+#cds_blob <- load_monocle_objects("20260207_cds_blob")
+
+```
+## Matrisome analysis test
+```{r}
+#install.packages("dplyr")
+#install.packages("data.table")
+#install.packages("ggplot2")
+#install.packages("ggalluvial")
+#install.packages("crayon")
+#devtools::install_github("izzilab/MatrisomeAnalyzeR")
+library("MatrisomeAnalyzeR")
+```
+## Matrisome
+```{r}
+cds_lo <- load_monocle_objects("20260204_cds_labeled_cleaned_pseudotime.rds")
+
+gene_short_name <- fData(cds_lo)$gene_short_name
+gene_id <- fData(cds_lo)$gene_id
+
+clusters <- c(0:7)
+names(clusters) <- unique(colData(cds_lo)$identity)
+for (i in clusters) {
+  cells_i <- rownames(colData(cds_lo))[colData(cds_lo)$identity == names(clusters[i + 1])] 
+  expr_i <- as.matrix(counts(cds_lo))[, cells_i, drop = FALSE]
+  avg <- as.data.frame(rowMeans(expr_i, na.rm = TRUE)) %>% setNames("all")
+  gns <- as.data.frame(rownames(subset(avg, all > 3)))
+  colnames(gns) <- "Gene.Symbol"
+  gns$Gene.Symbol <- gene_short_name[match(gns$Gene.Symbol,gene_id)]
+  ann <- matriannotate(data = gns, gene.column = "Gene.Symbol", species = "mouse")
+  nam <- paste("cluster", names(clusters[i + 1]), sep = "_")
+  assign(nam, ann)
+}
+
+clusters_list <- list(
+cluster_1_early_cycling_OPC = cluster_1_early_cycling_OPC,
+cluster_2_late_cycling_OPC  = cluster_2_late_cycling_OPC,
+cluster_3_quiescent_OPC     = cluster_3_quiescent_OPC,
+cluster_4_differentiating_OPC = cluster_4_differentiating_OPC,
+cluster_5_newly_formed_ol   = cluster_5_newly_formed_ol,
+cluster_6_myelin_forming_ol = cluster_6_myelin_forming_ol
+)
+annot_col <- "Annotated Matrisome Category"
+all_annot <- bind_rows(
+lapply(names(clusters_list), function(nm) {
+df <- clusters_list[[nm]]
+if (!annot_col %in% colnames(df)) {
+stop(sprintf("Column '%s' not found in %s", annot_col, nm))
+}
+df %>% mutate(Cluster = nm)
+})
+)
+counts_per_cluster <- all_annot %>%
+group_by(Cluster, .data[[annot_col]]) %>%
+summarise(n = n(), .groups = "drop")
+
+counts_per_cluster <-  counts_per_cluster[!(counts_per_cluster$`Annotated Matrisome Category` %in%c("Non-matrisome")),]
+ggplot(counts_per_cluster, aes(x = Cluster, y = n, fill = .data[[annot_col]])) +
+geom_bar(stat = "identity") +
+labs(x = "Cluster", y = "Gene count", fill = "Matrisome category",
+title = "Matrisome annotations per cluster") +
+theme_classic() +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+tab <- tidyr::pivot_wider(counts_per_cluster,
+names_from = "Annotated Matrisome Category",
+values_from = n,
+values_fill = 0)
+mat <- as.matrix(tab[ , setdiff(names(tab), "Cluster")])
+rownames(mat) <- tab$Cluster
+chisq.test(mat)
+
+```
+
+#Testing identified genes present at different stages
+```{r}
+plot_cells(cds_lo, genes = c("Col9a3"), label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 5, cell_size=2) 
+plot_cells(cds_lo, genes = c("Serpine2"), label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 5, cell_size=2)
+plot_cells(cds_lo, genes = c("Itih3"), label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 5, cell_size=2) plot_cells(cds_lo, genes = c("Plat"), label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 5, cell_size=2) 
+
+```
+
+##ED 3i-j- Violin plots over developmental trajectory
+```{r}
+#Using the old dataset for this
+cds_old <- readRDS("C:/Users/User/OneDrive - Johns Hopkins/Documents/R_Data/96Rik_w_Matn4/Re-analysis/20231206_combined_matn4_96rik.rds")
+cds_subset <- cds_old[rowData(cds_old)$gene_short_name %in% c("Pcdh17", "9630013A20Rik", "EGFP")]
+cds_subset <- cds_subset[,grepl("lncOL1_EGFP", colData(cds_subset)$genotype)]
+cds_subset <- cds_subset[,(as.character(pData(cds_subset)$identity) %in% c("4_late_diff_OPC","5_NFO","6_mature_OL"))]
+plot_genes_violin(cds_subset, label_by_short_name = TRUE, group_cells_by = "identity")
+
+
+gene_fits_identity <- fit_models(cds_subset, 
+                             model_formula_str = "~num_genes_expressed+identity",
+                             cores=2,
+                             clean_model=TRUE,
+                             verbose=TRUE
+                             )
+
+fit_coefs <- coefficient_table(gene_fits_identity)
+id_terms <- fit_coefs %>% filter(term == "identity")
+id_terms <- fit_coefs %>% filter(grepl("identity",term))
+
+sig_id_terms<-id_terms %>% filter(q_value < 0.01 ) %>%
+  dplyr::select(gene_id, gene_short_name, term, q_value, estimate, description)
+
+
+write.csv(sig_id_terms,"C:/Users/User/OneDrive - Johns Hopkins/Documents/R_Data/96Rik_w_Matn4/Re-analysis/significant_id_terms.csv")
+
+
+cds_subset <- cds_old[,grepl("lncOL1_EGFP", colData(cds_old)$genotype)]
+cds_subset <- cds_subset[,(as.character(pData(cds_subset)$identity) %in% c("4_late_diff_OPC","5_NFO","6_mature_OL"))]
+marker_genes <- c("Pcdh17","EGFP","9630013A20Rik","Opalin","Tcf7l2","Bcas1")
+plot_cells(cds_subset, genes = marker_genes, label_cell_groups = FALSE, show_trajectory_graph = FALSE, min_expr = 2)
+
+#Graph autocorrelation analysis
+pr_graph_test_res <- graph_test(cds_subset)
+pr_deg_ids <- row.names(subset(pr_graph_test_res, q_value < 0.05))
+#All three vary significantly
+
+
+gene_fits <- fit_models(cds_subset, model_formula_str = "~cluster")
+fit_coefs <- coefficient_table(gene_fits)
+
+```
+
+
+
+#End of revisions code
+```{r}
+sessionInfo()
+
+```
+R version 4.5.2 (2025-10-31 ucrt)
+Platform: x86_64-w64-mingw32/x64
+Running under: Windows 11 x64 (build 26100)
+
+Matrix products: default
+  LAPACK version 3.12.1
+
+locale:
+[1] LC_COLLATE=English_United States.utf8 
+[2] LC_CTYPE=English_United States.utf8   
+[3] LC_MONETARY=English_United States.utf8
+[4] LC_NUMERIC=C                          
+[5] LC_TIME=English_United States.utf8    
+
+time zone: America/New_York
+tzcode source: internal
+
+attached base packages:
+[1] stats4    stats     graphics  grDevices utils     datasets 
+[7] methods   base     
+
+other attached packages:
+ [1] Seurat_5.4.0                SeuratObject_5.3.0         
+ [3] sp_2.2-0                    MatrisomeAnalyzeR_1.0.1    
+ [5] ggalluvial_0.12.5           crayon_1.5.3               
+ [7] data.table_1.18.2.1         dplyr_1.1.4                
+ [9] ggplot2_4.0.2               monocle3_1.4.26            
+[11] SingleCellExperiment_1.30.1 SummarizedExperiment_1.38.1
+[13] GenomicRanges_1.60.0        GenomeInfoDb_1.44.3        
+[15] IRanges_2.42.0              S4Vectors_0.46.0           
+[17] MatrixGenerics_1.20.0       matrixStats_1.5.0          
+[19] Biobase_2.68.0              BiocGenerics_0.54.1        
+[21] generics_0.1.4             
+
+loaded via a namespace (and not attached):
+  [1] RcppAnnoy_0.0.22         later_1.4.5             
+  [3] splines_4.5.2            BiocIO_1.18.0           
+  [5] bitops_1.0-9             tibble_3.3.0            
+  [7] polyclip_1.10-7          XML_3.99-0.20           
+  [9] fastDummies_1.7.5        lifecycle_1.0.5         
+ [11] Rdpack_2.6.5             globals_0.19.0          
+ [13] processx_3.8.6           lattice_0.22-7          
+ [15] ensembldb_2.32.0         MASS_7.3-65             
+ [17] magrittr_2.0.3           plotly_4.12.0           
+ [19] sass_0.4.10              rmarkdown_2.30          
+ [21] jquerylib_0.1.4          yaml_2.3.10             
+ [23] remotes_2.5.0            httpuv_1.6.16           
+ [25] otel_0.2.0               sctransform_0.4.3       
+ [27] spam_2.11-3              spatstat.sparse_3.1-0   
+ [29] sessioninfo_1.2.3        pkgbuild_1.4.8          
+ [31] reticulate_1.44.1        pbapply_1.7-4           
+ [33] cowplot_1.2.0            DBI_1.2.3               
+ [35] minqa_1.2.8              RColorBrewer_1.1-3      
+ [37] lubridate_1.9.5          abind_1.4-8             
+ [39] pkgload_1.5.0            Rtsne_0.17              
+ [41] purrr_1.2.1              AnnotationFilter_1.32.0 
+ [43] RCurl_1.98-1.17          GenomeInfoDbData_1.2.14 
+ [45] ggrepel_0.9.6            irlba_2.3.7             
+ [47] spatstat.utils_3.2-1     listenv_0.10.0          
+ [49] goftest_1.2-3            RSpectra_0.16-2         
+ [51] spatstat.random_3.4-4    fitdistrplus_1.2-6      
+ [53] parallelly_1.45.1        codetools_0.2-20        
+ [55] DelayedArray_0.34.1      tidyselect_1.2.1        
+ [57] UCSC.utils_1.4.0         farver_2.1.2            
+ [59] lme4_1.1-37              viridis_0.6.5           
+ [61] spatstat.explore_3.7-0   GenomicAlignments_1.44.0
+ [63] jsonlite_2.0.0           ellipsis_0.3.2          
+ [65] progressr_0.18.0         ggridges_0.5.7          
+ [67] survival_3.8-3           tools_4.5.2             
+ [69] ica_1.0-3                Rcpp_1.1.0              
+ [71] glue_1.8.0               gridExtra_2.3           
+ [73] SparseArray_1.8.1        xfun_0.52               
+ [75] usethis_3.2.1            withr_3.0.2             
+ [77] fastmap_1.2.0            boot_1.3-32             
+ [79] callr_3.7.6              digest_0.6.37           
+ [81] mime_0.13                timechange_0.4.0        
+ [83] R6_2.6.1                 scattermore_1.2         
+ [85] tensor_1.5.1             spatstat.data_3.1-9     
+ [87] RSQLite_2.4.5            tidyr_1.3.2             
+ [89] rtracklayer_1.68.0       htmlwidgets_1.6.4       
+ [91] httr_1.4.7               S4Arrays_1.8.1          
+ [93] uwot_0.2.4               pkgconfig_2.0.3         
+ [95] gtable_0.3.6             rsconnect_1.7.0         
+ [97] blob_1.3.0               lmtest_0.9-40           
+ [99] S7_0.2.1                 XVector_0.48.0          
+[101] htmltools_0.5.8.1        dotCall64_1.2           
+[103] plyranges_1.28.0         ProtGenerics_1.40.0     
+[105] scales_1.4.0             png_0.1-8               
+[107] spatstat.univar_3.1-6    reformulas_0.4.4        
+[109] knitr_1.51               rstudioapi_0.18.0       
+[111] reshape2_1.4.5           rjson_0.2.23            
+[113] nlme_3.1-168             curl_7.0.0              
+[115] nloptr_2.2.1             zoo_1.8-15              
+[117] cachem_1.1.0             stringr_1.6.0           
+[119] KernSmooth_2.23-26       miniUI_0.1.2            
+[121] parallel_4.5.2           AnnotationDbi_1.70.0    
+[123] restfulr_0.0.16          desc_1.4.3              
+[125] pillar_1.11.1            grid_4.5.2              
+[127] vctrs_0.6.5              RANN_2.6.2              
+[129] promises_1.5.0           xtable_1.8-4            
+[131] cluster_2.1.8.1          evaluate_1.0.5          
+[133] GenomicFeatures_1.60.0   cli_3.6.5               
+[135] compiler_4.5.2           Rsamtools_2.24.1        
+[137] rlang_1.1.6              future.apply_1.20.1     
+[139] labeling_0.4.3           ps_1.9.1                
+[141] plyr_1.8.9               fs_1.6.6                
+[143] stringi_1.8.7            deldir_2.0-4            
+[145] viridisLite_0.4.3        BiocParallel_1.42.2     
+[147] assertthat_0.2.1         Biostrings_2.76.0       
+[149] lazyeval_0.2.2           spatstat.geom_3.7-0     
+[151] devtools_2.4.6           Matrix_1.7-4            
+[153] RcppHNSW_0.6.0           patchwork_1.3.2         
+[155] bit64_4.6.0-1            future_1.69.0           
+[157] shiny_1.12.1             KEGGREST_1.48.1         
+[159] rbibutils_2.4.1          ROCR_1.0-12             
+[161] igraph_2.1.4             memoise_2.0.1           
+[163] bslib_0.10.0             bit_4.6.0  
+
+
